@@ -3,6 +3,7 @@
 #include <cuda_runtime.h>
 #include <cub/cub.cuh>
 #include <mpi.h>
+#include <nccl.h>
 
 #define NUM_DEVICES 4
 
@@ -12,7 +13,6 @@
             cudaGetErrorString(err)); \
     exit(EXIT_FAILURE); \
   }
-
 
 void setDevice(int rank)
 {
@@ -84,7 +84,7 @@ void interpolateVertical(double* arr, double topValue, double bottomValue, int s
     }
 }
 
-double* getSetMatrix(double* dst, int numElems, int matrix_size)
+double* getSetMatrix(double* dst, int numElems, int matrix_size, cudaStream_t stream)
 {
     cudaError_t err;
 
@@ -94,11 +94,11 @@ double* getSetMatrix(double* dst, int numElems, int matrix_size)
 
     // filling with zeros cuda matrix
     double *zeroMx = (double*)calloc(numElems + 2 * matrix_size, sizeof(double));
-    err = cudaMemcpy(matrix, zeroMx, (numElems + 2 * matrix_size) * sizeof(double), cudaMemcpyHostToDevice);
+    err = cudaMemcpyAsync(matrix, zeroMx, (numElems + 2 * matrix_size) * sizeof(double), cudaMemcpyHostToDevice, stream);
     CUDACHKERR(err);
 
     // copying the matrix from the CPU to the GPU, with the space for the boundary values
-    err = cudaMemcpy(matrix + matrix_size, dst, numElems * sizeof(double), cudaMemcpyHostToDevice);
+    err = cudaMemcpyAsync(matrix + matrix_size, dst, numElems * sizeof(double), cudaMemcpyHostToDevice, stream);
     CUDACHKERR(err);
 
     free(zeroMx);
@@ -129,7 +129,6 @@ __global__ void vecNeg(const double *newA, const double *A, double* ans, int mx_
 
 int main(int argc, char *argv[])
 {
-    MPI_Status status;
     int local_rank, numProcess;
     MPI_Init(&argc, &argv);
 
@@ -139,6 +138,13 @@ int main(int argc, char *argv[])
 
     MPI_Comm_rank(MPI_COMM_WORLD, &local_rank);
     MPI_Comm_size(MPI_COMM_WORLD, &numProcess);
+
+    ncclUniqueId id;
+    if (local_rank == 0) ncclGetUniqueId(&id);
+
+    MPI_Bcast(&id, sizeof(id), MPI_BYTE, 0, MPI_COMM_WORLD);
+
+    setDevice(local_rank);
 
     cudaError_t err;
 
@@ -150,7 +156,8 @@ int main(int argc, char *argv[])
     double *tmp_d = NULL;
     double *max_d = NULL;
 
-    setDevice(local_rank);
+    cudaStream_t stream;
+    cudaStreamCreate(&stream);
 
     int start, end;
     getArrayBoundaries(&start, &end, local_rank, matrix_size, numProcess);
@@ -174,8 +181,8 @@ int main(int argc, char *argv[])
 
     // copying to GPU
 
-    A_d = getSetMatrix(tmp, numElems, matrix_size);
-    newA_d = getSetMatrix(tmp, numElems, matrix_size);
+    A_d = getSetMatrix(tmp, numElems, matrix_size, stream);
+    newA_d = getSetMatrix(tmp, numElems, matrix_size, stream);
     free(tmp);
 
     dim3 GS = dim3(16, 16);
@@ -184,7 +191,7 @@ int main(int argc, char *argv[])
     cudaMalloc(&tmp_d, sizeof(double) * numElems);
     cudaMalloc(&max_d, sizeof(double));
 
-    cub::DeviceReduce::Max(d_temp_storage, temp_storage_bytes, tmp_d, max_d, numRows * matrix_size);
+    cub::DeviceReduce::Max(d_temp_storage, temp_storage_bytes, tmp_d, max_d, numRows * matrix_size, stream);
     cudaMalloc(&d_temp_storage, temp_storage_bytes);
 
     // calculation of ranks of processes with which boundary values are exchanged
@@ -199,34 +206,38 @@ int main(int argc, char *argv[])
     int BS_neg = ceil(numElems / (double)GS_neg);
 
     int iter = 0;
-    double error = 10;
-    double local_error = 0;
+    double error = 12321;
+    double *gpu_error;
+    cudaMalloc(&gpu_error, sizeof(double));
+
+    ncclComm_t comm;
+    ncclCommInitRank(&comm, numProcess, id, local_rank);
 
     while (error > min_error && iter < iter_max)
     {
         ++iter;
 
-        MPI_Sendrecv(A_d + matrix_size, matrix_size, MPI_DOUBLE, bottomProcess, local_rank,
-                     A_d + numElems + matrix_size, matrix_size, MPI_DOUBLE, topProcess, topProcess,
-                     MPI_COMM_WORLD, &status);
+        ncclGroupStart();
+        ncclSend(A_d + matrix_size, matrix_size, ncclDouble, bottomProcess, comm, stream);
+        ncclSend(A_d + numElems, matrix_size, ncclDouble, topProcess, comm, stream);
 
-        MPI_Sendrecv(A_d + numElems, matrix_size, MPI_DOUBLE, topProcess, local_rank,
-                     A_d, matrix_size, MPI_DOUBLE, bottomProcess, bottomProcess,
-                     MPI_COMM_WORLD, &status);
+        ncclRecv(A_d + numElems + matrix_size, matrix_size, ncclDouble, topProcess, comm, stream);
+        ncclRecv(A_d, matrix_size, ncclDouble, bottomProcess, comm, stream);
+        ncclGroupEnd();
 
-        evalEquation<<<BS, GS>>>(newA_d, A_d, matrix_size, y_start, y_end);
+        evalEquation<<<BS, GS, 0, stream>>>(newA_d, A_d, matrix_size, y_start, y_end);
 
         if (iter % 100 == 0)
-        {
-            vecNeg<<<BS_neg, GS_neg>>>(newA_d, A_d, tmp_d, matrix_size, numElems);
+        {       
+            vecNeg<<<BS_neg, GS_neg, 0, stream>>>(newA_d, A_d, tmp_d, matrix_size, numElems);
 
-            err = cub::DeviceReduce::Max(d_temp_storage, temp_storage_bytes, tmp_d, max_d, numRows * matrix_size);
+            err = cub::DeviceReduce::Max(d_temp_storage, temp_storage_bytes, tmp_d, max_d, numRows * matrix_size, stream);
             CUDACHKERR(err);
 
-            err = cudaMemcpy(&local_error, max_d, sizeof(double), cudaMemcpyDeviceToHost);
-            CUDACHKERR(err);
+            ncclAllReduce(max_d, gpu_error, 1, ncclDouble, ncclMax, comm, stream);
 
-            MPI_Allreduce(&local_error, &error, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
+            err = cudaMemcpyAsync(&error, gpu_error, sizeof(double), cudaMemcpyDeviceToHost, stream);
+            CUDACHKERR(err);
 
             if (local_rank == 0)
             {
@@ -244,6 +255,8 @@ int main(int argc, char *argv[])
     cudaFree(tmp_d);
     cudaFree(max_d);
 
+    cudaStreamDestroy(stream);
+    ncclCommDestroy(comm);
     MPI_Finalize();
 
     return 0;
